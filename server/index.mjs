@@ -246,6 +246,7 @@ app.post("/api/chat", async (req, res) => {
 
   // 文件上下文（用户上传的文件内容）
   const fileContext = req.body.fileContext || null;
+  console.log("[/api/chat] fileContext received:", fileContext ? { fileName: fileContext.fileName, type: fileContext.type, textLength: fileContext.text?.length } : null);
 
   const openai = createOpenAI({
     apiKey: process.env.OPENAI_API_KEY,

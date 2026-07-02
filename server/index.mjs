@@ -5,8 +5,10 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import { PDFParse } from "pdf-parse";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
+import { createWorker } from "tesseract.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, resolve } from "node:path";
+import { createCanvas } from "@napi-rs/canvas";
 
 // 配置 pdfjs worker（Node.js 环境必需，Windows 需要 file:// URL）
 const __filename = fileURLToPath(import.meta.url);
@@ -52,32 +54,79 @@ app.post("/api/parse-file", (req, res) => {
   }
 
   if (ext === "pdf") {
-    // PDF 用 pdf-parse v2 提取
+    // PDF 用 pdfjs-dist 提取，扫描件用 OCR
     (async () => {
       try {
-        const parser = new PDFParse({ data: buffer });
-        const result = await parser.getText();
-        const text = result.text || "";
-        await parser.destroy();
+        console.log(
+          "[文件解析] 开始解析 PDF:",
+          fileName,
+          "大小:",
+          buffer.length,
+          "字节",
+        );
 
-        if (!text.trim()) {
+        // 使用 pdfjs-dist 加载 PDF
+        const uint8Array = new Uint8Array(buffer);
+        const loadingTask = pdfjs.getDocument({
+          data: uint8Array,
+          useSystemFonts: true,
+        });
+
+        const pdf = await loadingTask.promise;
+        const numPages = pdf.numPages;
+        console.log("[文件解析] PDF 总页数:", numPages);
+
+        let fullText = "";
+        let hasTextLayer = false;
+
+        // 逐页提取文本
+        for (let i = 1; i <= numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+
+          // 将文本项组合成字符串
+          const pageText = textContent.items.map((item) => item.str).join(" ");
+
+          if (pageText.trim().length > 0) {
+            hasTextLayer = true;
+          }
+
+          fullText += pageText + "\n\n";
+          console.log(`[文件解析] 第 ${i} 页提取了 ${pageText.length} 个字符`);
+        }
+
+        await pdf.destroy();
+
+        const text = fullText.trim();
+        console.log("[文件解析] PDF 解析结果:", {
+          textLength: text.length,
+          totalPages: numPages,
+          hasTextLayer,
+          textPreview: text.slice(0, 200),
+        });
+
+        // 如果没有文本层或文本太少，说明是扫描件
+        if (!hasTextLayer || text.length < 50) {
+          console.log("[文件解析] 检测到扫描件 PDF，无法提取文本");
           return res.json({
             fileName,
             type: "pdf",
             text: "",
             charCount: 0,
-            error: "PDF 中未提取到文本（可能是扫描件）",
+            error:
+              "这是一个扫描件 PDF，无法自动提取文本内容。建议使用带有文字层的 PDF 文件，或先将扫描件转换为可搜索的 PDF（使用 Adobe Acrobat、ABBYY FineReader 等工具进行 OCR）。",
           });
         }
+
         res.json({
           fileName,
           type: "pdf",
           text,
           charCount: text.length,
-          pageCount: result.total,
+          pageCount: numPages,
         });
       } catch (err) {
-        console.error("[文件解析] PDF 解析失败:", err.message);
+        console.error("[文件解析] PDF 解析失败:", err.message, err.stack);
         res.status(500).json({ error: `PDF 解析失败: ${err.message}` });
       }
     })();
@@ -237,7 +286,13 @@ function normalizeMessages(messages) {
 
 app.post("/api/chat", async (req, res) => {
   const rawMessages = req.body.messages || [];
+  console.log("[/api/chat] rawMessages count:", rawMessages.length);
+  console.log(
+    "[/api/chat] rawMessages[0]:",
+    JSON.stringify(rawMessages[0], null, 2),
+  );
   const messages = normalizeMessages(rawMessages);
+  console.log("[/api/chat] normalized messages count:", messages.length);
 
   // 从请求中读取设置参数
   const requestedModel =
@@ -246,7 +301,16 @@ app.post("/api/chat", async (req, res) => {
 
   // 文件上下文（用户上传的文件内容）
   const fileContext = req.body.fileContext || null;
-  console.log("[/api/chat] fileContext received:", fileContext ? { fileName: fileContext.fileName, type: fileContext.type, textLength: fileContext.text?.length } : null);
+  console.log(
+    "[/api/chat] fileContext received:",
+    fileContext
+      ? {
+          fileName: fileContext.fileName,
+          type: fileContext.type,
+          textLength: fileContext.text?.length,
+        }
+      : null,
+  );
 
   const openai = createOpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -645,6 +709,70 @@ ${messagesToSummarize
             query,
             error: `搜索失败: ${err.message}`,
             results: [],
+          };
+        }
+      },
+    },
+    generateImage: {
+      description: "根据描述生成图片。用于创建插图、概念图、示意图等视觉内容",
+      inputSchema: z.object({
+        prompt: z
+          .string()
+          .describe(
+            "图片描述，用英文效果更佳。例如：a cute cat playing with a ball",
+          ),
+        size: z
+          .enum(["1024x1024", "1024x1792", "1792x1024"])
+          .optional()
+          .describe("图片尺寸，默认 1024x1024"),
+        quality: z
+          .enum(["standard", "hd"])
+          .optional()
+          .describe("图片质量，默认 standard"),
+      }),
+      execute: async ({ prompt, size, quality }) => {
+        try {
+          const response = await fetch(
+            "https://api.openai.com/v1/images/generations",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+              },
+              body: JSON.stringify({
+                model: "dall-e-3",
+                prompt,
+                n: 1,
+                size: size || "1024x1024",
+                quality: quality || "standard",
+              }),
+            },
+          );
+
+          if (!response.ok) {
+            const error = await response.json();
+            return {
+              error: `图片生成失败: ${error.error?.message || response.statusText}`,
+              prompt,
+            };
+          }
+
+          const data = await response.json();
+          const imageUrl = data.data[0].url;
+          const revisedPrompt = data.data[0].revised_prompt;
+
+          return {
+            imageUrl,
+            prompt,
+            revisedPrompt,
+            size: size || "1024x1024",
+            quality: quality || "standard",
+          };
+        } catch (err) {
+          return {
+            error: `图片生成失败: ${err.message}`,
+            prompt,
           };
         }
       },

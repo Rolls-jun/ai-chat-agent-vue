@@ -28,17 +28,20 @@ import SettingsModal from "./components/SettingsModal.vue";
 // ===== 自定义 useChat =====
 function useChat({ initialMessages = [] }) {
   const chat = new Chat({
-    transport: {
-      async sendMessages({ messages }) {
+    transport: new DefaultChatTransport({
+      api: "/api/chat",
+      prepareSendMessagesRequest({ body, headers, messages }) {
         const settings = JSON.parse(
           localStorage.getItem("agent-settings") ||
             '{"model":"deepseek-chat","temperature":0.7}'
         );
-
-        // 在发送请求前读取 fileContext
         const fileContext = window.__fileContext || null;
         console.log(
-          "[sendMessages] fileContext:",
+          "[prepareSendMessagesRequest] window.__fileContext:",
+          window.__fileContext
+        );
+        console.log(
+          "[prepareSendMessagesRequest] fileContext:",
           fileContext
             ? {
                 fileName: fileContext.fileName,
@@ -47,21 +50,26 @@ function useChat({ initialMessages = [] }) {
               }
             : null
         );
-
-        const response = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            messages,
-            model: settings.model,
-            temperature: settings.temperature,
-            fileContext,
-          }),
+        const requestBody = {
+          ...body,
+          messages,
+          model: settings.model,
+          temperature: settings.temperature,
+          fileContext,
+        };
+        console.log("[prepareSendMessagesRequest] requestBody:", {
+          messages: requestBody.messages?.length,
+          model: requestBody.model,
+          fileContext: requestBody.fileContext
+            ? { fileName: requestBody.fileContext.fileName }
+            : null,
         });
-
-        return response;
+        return {
+          body: requestBody,
+          headers,
+        };
       },
-    },
+    }),
     messages: initialMessages,
   });
   const messages = computed(() => chat.messages);
@@ -187,7 +195,6 @@ const savedMessages = (() => {
 })();
 
 const { messages, sendMessage, status, stop, error, regenerate } = useChat({
-  transport: new DefaultChatTransport({ api: "/api/chat" }),
   initialMessages: savedMessages,
 });
 

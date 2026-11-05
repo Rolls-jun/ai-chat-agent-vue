@@ -75,7 +75,7 @@ function getTime(chat) {
             </div>
             <button
               @click.stop="emit('delete-chat', chat.id)"
-              class="shrink-0 flex h-6 w-6 items-center justify-center rounded-md text-zinc-600 opacity-0 group-hover:opacity-100 hover:bg-red-500/10 hover:text-red-400 transition-all"
+              class="shrink-0 flex h-6 w-6 items-center justify-center rounded-md text-zinc-500 hover:bg-red-500/10 hover:text-red-400 transition-all"
               title="删除对话"
             >
               <Trash2 class="h-3.5 w-3.5" />

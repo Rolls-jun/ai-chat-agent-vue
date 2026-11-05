@@ -1,7 +1,7 @@
 <script setup>
 import { Chat } from "@ai-sdk/vue";
 import { DefaultChatTransport } from "ai";
-import { computed, ref, watch, onMounted } from "vue";
+import { computed, ref, shallowRef, watch, onMounted } from "vue";
 import {
   Bot,
   Calculator,
@@ -19,14 +19,15 @@ import {
   Edit,
   Check,
   FileText,
+  Trash2,
   X,
 } from "lucide-vue-next";
 import MarkdownRenderer from "./components/MarkdownRenderer.vue";
 import ChatSidebar from "./components/ChatSidebar.vue";
 import SettingsModal from "./components/SettingsModal.vue";
 
-// ===== 自定义 useChat =====
-function useChat({ initialMessages = [] }) {
+// ===== 创建 Chat 实例（每个对话一个实例） =====
+function createChatInstance(initialMessages = []) {
   const chat = new Chat({
     transport: new DefaultChatTransport({
       api: "/api/chat",
@@ -72,36 +73,7 @@ function useChat({ initialMessages = [] }) {
     }),
     messages: initialMessages,
   });
-  const messages = computed(() => chat.messages);
-  const status = computed(() => chat.status);
-
-  // 使用 ref 包装 error，手动控制
-  const errorRef = ref(null);
-
-  // 发送新消息时清除旧错误
-  const origSendMessage = chat.sendMessage.bind(chat);
-  const sendMessage = async (...args) => {
-    errorRef.value = null;
-    try {
-      const result = await origSendMessage(...args);
-      if (chat.error) {
-        errorRef.value = chat.error;
-      }
-      return result;
-    } catch (err) {
-      errorRef.value = err;
-      throw err;
-    }
-  };
-
-  return {
-    messages,
-    status,
-    error: computed(() => errorRef.value),
-    sendMessage,
-    stop: chat.stop.bind(chat),
-    regenerate: chat.regenerate.bind(chat),
-  };
+  return chat;
 }
 
 // ===== 对话列表管理 =====
@@ -119,21 +91,11 @@ function saveChatList(list) {
 
 const chatList = ref(loadChatList());
 const chatId = ref(localStorage.getItem("current-chat-id") || "");
-
-// 如果是首次使用，自动创建新对话
-if (!chatId.value || chatList.value.length === 0) {
-  createNewChat();
-} else {
-  // 确保当前 chatId 在列表中
-  if (!chatList.value.find((c) => c.id === chatId.value)) {
-    createNewChat();
-  }
-}
+// 待确认删除的对话
+const pendingDeleteChat = ref(null);
 
 function createNewChat() {
   const id = crypto.randomUUID();
-  chatId.value = id;
-  localStorage.setItem("current-chat-id", id);
   chatList.value.unshift({
     id,
     title: "新对话",
@@ -141,23 +103,33 @@ function createNewChat() {
     updatedAt: Date.now(),
   });
   saveChatList(chatList.value);
+  switchChat(id);
 }
 
 function selectChat(id) {
-  chatId.value = id;
-  localStorage.setItem("current-chat-id", id);
+  switchChat(id);
 }
 
-function deleteChat(id) {
+function requestDeleteChat(id) {
+  const chat = chatList.value.find((c) => c.id === id);
+  if (!chat) return;
+  pendingDeleteChat.value = chat;
+}
+
+function confirmDeleteChat() {
+  const id = pendingDeleteChat.value?.id;
+  pendingDeleteChat.value = null;
+  if (!id) return;
   // 从列表移除
   chatList.value = chatList.value.filter((c) => c.id !== id);
   saveChatList(chatList.value);
   // 清除消息
   localStorage.removeItem(`chat-${id}`);
-  // 如果删的是当前对话，切到第一个或创建新的
+  // 如果删的是当前对话，先终止在途请求，再切到第一个或创建新的
   if (id === chatId.value) {
+    chatRef.value.stop();
     if (chatList.value.length > 0) {
-      selectChat(chatList.value[0].id);
+      switchChat(chatList.value[0].id);
     } else {
       createNewChat();
     }
@@ -185,18 +157,38 @@ function updateChatMeta(messagesArr) {
 }
 
 // ===== 当前对话 =====
-const savedMessages = (() => {
+function loadChatMessages(id) {
   try {
-    const stored = localStorage.getItem(`chat-${chatId.value}`);
+    const stored = localStorage.getItem(`chat-${id}`);
     return stored ? JSON.parse(stored) : [];
   } catch {
     return [];
   }
-})();
+}
 
-const { messages, sendMessage, status, stop, error, regenerate } = useChat({
-  initialMessages: savedMessages,
-});
+const chatRef = shallowRef(createChatInstance(loadChatMessages(chatId.value)));
+const messages = computed(() => chatRef.value.messages);
+const status = computed(() => chatRef.value.status);
+const error = computed(() => chatRef.value.error);
+const sendMessage = (...args) => chatRef.value.sendMessage(...args);
+const stop = () => chatRef.value.stop();
+const regenerate = (...args) => chatRef.value.regenerate(...args);
+
+// 切换对话：就地重建 Chat 实例，避免整页刷新打断进行中的回复
+function switchChat(id) {
+  if (id === chatId.value) return;
+  chatRef.value.stop();
+  chatId.value = id;
+  localStorage.setItem("current-chat-id", id);
+  chatRef.value = createChatInstance(loadChatMessages(id));
+}
+
+// 首次使用或当前对话已失效时，自动创建新对话
+if (!chatId.value || chatList.value.length === 0) {
+  createNewChat();
+} else if (!chatList.value.find((c) => c.id === chatId.value)) {
+  createNewChat();
+}
 
 const input = ref("");
 const messagesEndRef = ref(null);
@@ -212,11 +204,6 @@ watch(
   },
   { deep: true }
 );
-
-// chatId 变化时，需要重新初始化（页面会重新挂载）
-watch(chatId, () => {
-  location.reload();
-});
 
 // 自动滚动
 watch(
@@ -585,7 +572,7 @@ function regenerateMessage(messageIndex) {
         :class="[isMobile ? 'fixed left-0 top-0 h-full z-50 w-72' : 'relative']"
         @select-chat="selectChat"
         @new-chat="createNewChat"
-        @delete-chat="deleteChat"
+        @delete-chat="requestDeleteChat"
         @close="showSidebar = false"
       />
     </Transition>
@@ -1221,6 +1208,50 @@ function regenerateMessage(messageIndex) {
         </div>
       </footer>
     </div>
+
+    <!-- 删除对话二次确认 -->
+    <Teleport to="body">
+      <div
+        v-if="pendingDeleteChat"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4"
+      >
+        <div
+          class="absolute inset-0 bg-black/60 backdrop-blur-sm"
+          @click="pendingDeleteChat = null"
+        ></div>
+        <div
+          class="relative w-full max-w-sm rounded-2xl bg-zinc-900 border border-zinc-800 shadow-2xl p-6"
+        >
+          <div class="flex items-start gap-3">
+            <div
+              class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-500/10 text-red-400"
+            >
+              <Trash2 class="h-5 w-5" />
+            </div>
+            <div class="min-w-0">
+              <h2 class="text-base font-semibold text-zinc-100">删除对话</h2>
+              <p class="mt-1 text-sm text-zinc-400 break-words">
+                确定删除「{{ pendingDeleteChat.title }}」吗？该对话记录将被清除，此操作不可恢复。
+              </p>
+            </div>
+          </div>
+          <div class="mt-6 flex justify-end gap-2">
+            <button
+              @click="pendingDeleteChat = null"
+              class="rounded-lg px-4 py-2 text-sm text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition"
+            >
+              取消
+            </button>
+            <button
+              @click="confirmDeleteChat"
+              class="rounded-lg bg-red-500/90 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 transition"
+            >
+              删除
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- 设置面板 -->
     <SettingsModal

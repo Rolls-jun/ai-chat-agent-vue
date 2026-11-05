@@ -19,6 +19,11 @@ const modelOptions = [
   { value: "deepseek-chat", label: "DeepSeek-V4-Pro" },
   { value: "gpt-4o", label: "GPT-4o" },
   { value: "claude-3-5-sonnet", label: "Claude 3.5 Sonnet" },
+  { value: "qwen2.5:7b", label: "Qwen2.5 7B（本地 Ollama）" },
+  {
+    value: "deepseek-r1-distill-llama-8b",
+    label: "deepseek-r1-distill-llama-8b（本地 LM Studio）",
+  },
 ];
 
 // 加载设置

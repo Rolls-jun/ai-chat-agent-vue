@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { streamText, generateText, convertToModelMessages } from "ai";
+import { streamText, generateText, convertToModelMessages, stepCountIs } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import { PDFParse } from "pdf-parse";
@@ -312,13 +312,40 @@ app.post("/api/chat", async (req, res) => {
       : null,
   );
 
-  const openai = createOpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    ...(process.env.OPENAI_BASE_URL && {
-      baseURL: process.env.OPENAI_BASE_URL,
-    }),
-  });
+  // 本地模型（Ollama / LM Studio）都走 OpenAI 兼容接口，其余走云端
+  const collectModels = (value) =>
+    (value || "").split(",").map((m) => m.trim()).filter(Boolean);
+  const localProviders = [
+    {
+      name: "ollama",
+      models: collectModels(process.env.OLLAMA_CHAT_MODELS),
+      baseURL: process.env.OLLAMA_BASE_URL || "http://localhost:11434/v1",
+    },
+    {
+      name: "lmstudio",
+      models: collectModels(process.env.LMSTUDIO_MODELS),
+      baseURL: process.env.LMSTUDIO_BASE_URL || "http://localhost:1234/v1",
+    },
+  ];
+  const localProvider = localProviders.find((p) =>
+    p.models.includes(requestedModel),
+  );
+
+  const openai = localProvider
+    ? createOpenAI({
+        apiKey: localProvider.name,
+        baseURL: localProvider.baseURL,
+      })
+    : createOpenAI({
+        apiKey: process.env.OPENAI_API_KEY,
+        ...(process.env.OPENAI_BASE_URL && {
+          baseURL: process.env.OPENAI_BASE_URL,
+        }),
+      });
   const model = openai.chat(requestedModel);
+  console.log(
+    `[/api/chat] model=${requestedModel} provider=${localProvider?.name ?? "cloud"}`,
+  );
 
   // ===== 长对话记忆压缩 =====
   const COMPRESS_THRESHOLD = 20; // 超过 20 条消息触发压缩
@@ -517,9 +544,12 @@ ${messagesToSummarize
     "### webSearch — 联网搜索",
     "触发：",
     "- 用户的问题明显超出你知识截止日期（2025 年 8 月）",
-    "- 询问实时信息（新闻、股价、天气、赛事比分）",
+    "- 询问实时信息（新闻、股价、赛事比分）",
+    "- **明确询问天气**，如「北京现在天气怎么样」「上海今天气温多少度」「明天深圳会下雨吗」",
     "- 用户明确要求搜索",
     "- 你不确定的知识，可以先搜索再回答（标注来源）",
+    "",
+    "注意：天气是实时变化的数据，**必须**调用 webSearch 查询，不能用知识回答。",
     "",
     "搜索结果使用规则：",
     "- 综合多条结果给出答案，不要只读第一条",
@@ -779,44 +809,14 @@ ${messagesToSummarize
     },
   };
 
-  // ===== 手动 Agent Loop：最多 5 轮工具调用 =====
-  let loopMessages = await convertToModelMessages(messages);
-  let stepCount = 0;
-  const MAX_STEPS = 5;
-
-  while (stepCount < MAX_STEPS) {
-    stepCount++;
-    console.log(`[Agent Loop] 步骤 ${stepCount}`);
-
-    const stepResult = await generateText({
-      model,
-      system: finalSystemPrompt,
-      messages: loopMessages,
-      tools,
-    });
-
-    const toolCalls = stepResult.toolCalls;
-
-    // 没有工具调用 → 最终回答，跳出循环
-    if (!toolCalls || toolCalls.length === 0) {
-      loopMessages = stepResult.response.messages;
-      console.log(`[Agent Loop] 完成，共 ${stepCount} 步`);
-      break;
-    }
-
-    console.log(
-      `[Agent Loop] 调用了 ${toolCalls.length} 个工具: ${toolCalls.map((t) => t.toolName).join(", ")}`,
-    );
-
-    // 追加助手消息（含工具调用）到消息列表
-    loopMessages = [...stepResult.response.messages];
-  }
-
-  // 用 loopMessages 做最终流式输出（不再调用工具）
+  // ===== 流式输出（内置多步工具调用，最多 5 步） =====
   const result = streamText({
     model,
     system: finalSystemPrompt,
-    messages: loopMessages,
+    messages: await convertToModelMessages(messages),
+    tools,
+    temperature,
+    stopWhen: stepCountIs(5),
   });
 
   // 将 AI SDK 的响应转换成 Express 流式响应
